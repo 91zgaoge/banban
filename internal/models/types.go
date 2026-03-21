@@ -1,0 +1,147 @@
+package models
+
+import (
+	"errors"
+
+	"github.com/google/uuid"
+)
+
+type ModelType string
+
+const (
+	ModelTypeChat      ModelType = "chat"
+	ModelTypeEmbedding ModelType = "embedding"
+)
+
+const (
+	ModelInputText  = "text"
+	ModelInputImage = "image"
+)
+
+type ClientType string
+
+const (
+	ClientTypeOpenAI          ClientType = "openai"
+	ClientTypeOpenAICompat    ClientType = "openai-compat"
+	ClientTypeAnthropic       ClientType = "anthropic"
+	ClientTypeGoogle          ClientType = "google"
+	ClientTypeAzure           ClientType = "azure"
+	ClientTypeBedrock         ClientType = "bedrock"
+	ClientTypeMistral         ClientType = "mistral"
+	ClientTypeXAI             ClientType = "xai"
+	ClientTypeOllama          ClientType = "ollama"
+	ClientTypeDashscope       ClientType = "dashscope"
+	ClientTypeDeepSeek        ClientType = "deepseek"
+	ClientTypeZaiGlobal       ClientType = "zai-global"
+	ClientTypeZaiCN           ClientType = "zai-cn"
+	ClientTypeZaiCodingGlobal ClientType = "zai-coding-global"
+	ClientTypeZaiCodingCN     ClientType = "zai-coding-cn"
+	ClientTypeMinimaxGlobal   ClientType = "minimax-global"
+	ClientTypeMinimaxCN       ClientType = "minimax-cn"
+	ClientTypeMoonshotGlobal  ClientType = "moonshot-global"
+	ClientTypeMoonshotCN      ClientType = "moonshot-cn"
+	ClientTypeVolcengine      ClientType = "volcengine"
+	ClientTypeVolcengineCoding ClientType = "volcengine-coding"
+	ClientTypeQianfan         ClientType = "qianfan"
+	ClientTypeGroq            ClientType = "groq"
+	ClientTypeOpenRouter      ClientType = "openrouter"
+	ClientTypeTogether        ClientType = "together"
+	ClientTypeFireworks       ClientType = "fireworks"
+	ClientTypePerplexity      ClientType = "perplexity"
+	ClientTypeZhipu           ClientType = "zhipu"
+	ClientTypeSiliconflow     ClientType = "siliconflow"
+	ClientTypeNvidia          ClientType = "nvidia"
+	ClientTypeBailing         ClientType = "bailing"
+	ClientTypeXiaomi          ClientType = "xiaomi"
+	ClientTypeLongcat         ClientType = "longcat"
+	ClientTypeModelScope      ClientType = "modelscope"
+	ClientTypeKimiCoding      ClientType = "kimi-coding"
+)
+
+type Model struct {
+	ModelID             string    `json:"model_id"`
+	Name                string    `json:"name"`
+	LlmProviderID       string    `json:"llm_provider_id"`
+	IsMultimodal        bool      `json:"is_multimodal"`
+	Input               []string  `json:"input"`
+	Type                ModelType `json:"type"`
+	Dimensions          int       `json:"dimensions"`
+	ContextWindow       int       `json:"context_window"`
+	FallbackModelID     string    `json:"fallback_model_id,omitempty"`
+	Reasoning           bool      `json:"reasoning"`
+	MaxTokens           int       `json:"max_tokens"`
+	EnableTokenEstimate bool      `json:"enable_token_estimate"` // 是否启用 Token 估算，默认关闭以提升性能
+}
+
+func (m *Model) Validate() error {
+	if m.ModelID == "" {
+		return errors.New("model ID is required")
+	}
+	if m.LlmProviderID == "" {
+		return errors.New("llm provider ID is required")
+	}
+	if _, err := uuid.Parse(m.LlmProviderID); err != nil {
+		return errors.New("llm provider ID must be a valid UUID")
+	}
+	if m.Type != ModelTypeChat && m.Type != ModelTypeEmbedding {
+		return errors.New("invalid model type")
+	}
+	if m.Type == ModelTypeEmbedding && m.Dimensions <= 0 {
+		return errors.New("dimensions must be greater than 0")
+	}
+
+	return nil
+}
+
+type AddRequest Model
+
+type AddResponse struct {
+	ID      string `json:"id"`
+	ModelID string `json:"model_id"`
+}
+
+type GetRequest struct {
+	ID string `json:"id"`
+}
+
+type GetResponse struct {
+	ModelID string `json:"model_id"`
+	Model
+}
+
+type UpdateRequest Model
+
+type ListRequest struct {
+	Type       ModelType  `json:"type,omitempty"`
+	ClientType ClientType `json:"client_type,omitempty"`
+}
+
+type DeleteRequest struct {
+	ID      string `json:"id,omitempty"`
+	ModelID string `json:"model_id,omitempty"`
+}
+
+type DeleteResponse struct {
+	Message string `json:"message"`
+}
+
+type CountResponse struct {
+	Count int64 `json:"count"`
+}
+
+// TestStatus represents the result of a model connectivity test
+type TestStatus string
+
+const (
+	TestStatusOK         TestStatus = "ok"
+	TestStatusAuthError  TestStatus = "auth_error"
+	TestStatusError      TestStatus = "error"
+)
+
+// TestResponse represents the response from a model test
+type TestResponse struct {
+	Status    TestStatus `json:"status"`
+	Reachable bool       `json:"reachable"`
+	LatencyMs int64      `json:"latency_ms,omitempty"`
+	Message   string     `json:"message,omitempty"`
+}

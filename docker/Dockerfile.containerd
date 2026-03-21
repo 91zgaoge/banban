@@ -1,0 +1,140 @@
+# syntax=docker/dockerfile:1
+
+# ---- Stage 1: Build MCP binary ----
+FROM golang:1.25-alpine AS mcp-builder
+
+WORKDIR /src
+RUN apk add --no-cache ca-certificates git
+
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    GOPROXY=https://goproxy.cn,direct go mod download
+
+COPY . .
+
+ARG TARGETARCH=amd64
+ARG COMMIT_HASH=unknown
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} \
+    go build -trimpath \
+    -ldflags "-s -w -X github.com/Kxiandaoyan/Memoh-v2/internal/version.CommitHash=${COMMIT_HASH}" \
+    -o /out/mcp ./cmd/mcp
+
+# ---- Stage 2: Assemble MCP image rootfs ----
+FROM ubuntu:24.04 AS mcp-rootfs
+
+ARG TZ=UTC
+ENV TZ=${TZ}
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Base utilities + dumb-init (PID 1 init system to reap zombie processes)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl wget bash tzdata dumb-init \
+    && ln -snf "/usr/share/zoneinfo/${TZ}" /etc/localtime \
+    && echo "${TZ}" > /etc/timezone \
+    && rm -rf /var/lib/apt/lists/*
+
+# Node.js 20 + npm (provides npx for JS/TS MCP servers)
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Chromium + xvfb + dependencies (headless browser for agent-browser)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    chromium-browser libstdc++6 libharfbuzz0b libnss3 libfreetype6 xvfb \
+    && rm -rf /var/lib/apt/lists/*
+
+# ClawHub CLI + agent-browser + actionbook (skills + browser + web operation manuals)
+RUN npm install -g clawhub agent-browser @actionbookdev/cli
+
+# agent-fetch for web content extraction
+RUN npm install -g @teng-lin/agent-fetch
+# Patch agent-fetch to allow corporate proxy (10.71.252.4)
+RUN AGENT_FETCH_PATH=$(npm root -g)/@teng-lin/agent-fetch && \
+    sed -i "s/function isPrivateIP(ip) {/function isPrivateIP(ip) { if (ip === '10.71.252.4') return false;/" "$AGENT_FETCH_PATH/dist/fetch/http-client.js"
+
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium-browser
+
+# Python 3 + pip + uv (provides uvx for Python MCP servers)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-pip python3-venv \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -LsSf https://astral.sh/uv/install.sh | sh \
+    && ln -sf /root/.local/bin/uv /usr/local/bin/uv \
+    && ln -sf /root/.local/bin/uvx /usr/local/bin/uvx
+
+# OpenViking context database (optional, enabled per-bot)
+# Needs build toolchain: Go+make for AGFS server, gcc/g++/cmake for pybind11 C++ extensions
+# Note: Build may fail due to network issues, making it optional
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    golang-go make gcc g++ python3-dev cmake git \
+    && pip install openviking || echo "openviking install failed, skipping" \
+    && apt-get purge -y golang-go make gcc g++ python3-dev cmake git \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=mcp-builder /out/mcp /opt/mcp
+COPY cmd/mcp/template /opt/mcp-template
+
+# Use dumb-init wrapper script for proper zombie process reaping
+# Includes public DNS config for CNI networks (host DNS may not be reachable from bridge network)
+RUN printf '#!/bin/sh\n\
+[ -e /app/mcp ] || { mkdir -p /app; [ -f /opt/mcp ] \&\& cp -a /opt/mcp /app/mcp 2>/dev/null || true; }\n\
+[ -d /tmp ] || mkdir -p /tmp\n\
+chmod 1777 /tmp 2>/dev/null || true\n\
+# Configure public DNS for CNI networks (host DNS often not reachable from container bridge)\n\
+printf "nameserver 1.1.1.1\\nnameserver 8.8.8.8\\n" > /etc/resolv.conf 2>/dev/null || true\n\
+if [ -x /app/mcp ]; then exec /app/mcp "$@"; fi\n\
+exec /opt/mcp "$@"\n' > /opt/entrypoint-inner.sh && chmod +x /opt/entrypoint-inner.sh && \
+\
+printf '#!/bin/sh\n\
+exec /usr/bin/dumb-init -- /opt/entrypoint-inner.sh "$@"\n' > /opt/entrypoint.sh && chmod +x /opt/entrypoint.sh
+
+# Create rootfs tar excluding pseudo-filesystems
+RUN tar -cf /tmp/rootfs.tar \
+        --exclude=proc --exclude=sys --exclude=dev --exclude=run \
+        -C / .
+
+# ---- Stage 3: Package rootfs as Docker image tar ----
+FROM alpine:latest AS oci-exporter
+
+COPY --from=mcp-rootfs /tmp/rootfs.tar /tmp/layer.tar
+ARG MCP_IMAGE_TAG=docker.io/library/memoh-mcp:latest
+
+RUN set -e \
+    && LAYER_SHA=$(sha256sum /tmp/layer.tar | awk '{print $1}') \
+    && LAYER_SIZE=$(wc -c < /tmp/layer.tar) \
+    && mkdir -p "/tmp/image/${LAYER_SHA}" /out \
+    && mv /tmp/layer.tar "/tmp/image/${LAYER_SHA}/layer.tar" \
+    && printf '{"architecture":"amd64","os":"linux","created":"1970-01-01T00:00:00Z","config":{"Entrypoint":["/opt/entrypoint.sh"],"WorkingDir":"/app","Env":["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin","PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1","AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium-browser"]},"rootfs":{"type":"layers","diff_ids":["sha256:%s"]},"history":[{"created":"1970-01-01T00:00:00Z","comment":"memoh-mcp image"}]}' \
+       "${LAYER_SHA}" > /tmp/config.json \
+    && CONFIG_SHA=$(sha256sum /tmp/config.json | awk '{print $1}') \
+    && mv /tmp/config.json "/tmp/image/${CONFIG_SHA}.json" \
+    && printf '[{"Config":"%s.json","RepoTags":["%s"],"Layers":["%s/layer.tar"]}]' \
+       "${CONFIG_SHA}" "${MCP_IMAGE_TAG}" "${LAYER_SHA}" > /tmp/image/manifest.json \
+    && cd /tmp/image && tar -cf /out/memoh-mcp.tar manifest.json "${CONFIG_SHA}.json" "${LAYER_SHA}/"
+
+# ---- Stage 4: Containerd runtime ----
+FROM alpine:latest
+
+ARG TZ=UTC
+ENV TZ=${TZ}
+
+RUN apk add --no-cache containerd containerd-ctr tzdata cni-plugins \
+    && ln -snf "/usr/share/zoneinfo/${TZ}" /etc/localtime \
+    && echo "${TZ}" > /etc/timezone \
+    && mkdir -p /opt/cni/bin /etc/cni/net.d \
+    && cp -a /usr/libexec/cni/* /opt/cni/bin/ 2>/dev/null || true
+
+COPY --from=oci-exporter /out/memoh-mcp.tar /opt/images/memoh-mcp.tar
+COPY docker/containerd-entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+VOLUME ["/run/containerd", "/var/lib/containerd", "/opt/memoh/data"]
+
+HEALTHCHECK --interval=5s --timeout=3s --start-period=10s --retries=10 \
+    CMD test -S /run/containerd/containerd.sock
+
+ENTRYPOINT ["/entrypoint.sh"]

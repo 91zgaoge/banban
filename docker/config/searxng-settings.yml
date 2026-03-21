@@ -1,0 +1,178 @@
+use_default_settings: true
+
+server:
+  secret_key: "memoh-searxng-secret-key"
+  limiter: false
+  image_proxy: false
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  formats:
+    - html
+    - json
+  # 设置默认语言，避免 Google 引擎使用无效的 ZZ-ZZ 语言代码
+  default_lang: en
+  language: en-US
+
+# HTTP proxy configuration for outbound requests
+outgoing:
+  # 增加超时时间以应对慢速网络
+  request_timeout: 10.0
+  max_request_timeout: 15.0
+  # 连接池设置
+  pool_connections: 100
+  pool_maxsize: 100
+  # 使用常见浏览器的 User-Agent，减少被识别为爬虫的概率
+  useragent_suffix: ""
+  # 代理配置
+  proxies:
+    http:
+      - http://ccd:88152353@10.71.252.4:10810
+    https:
+      - http://ccd:88152353@10.71.252.4:10810
+  # 启用 HTTP/2 支持（如果可用）
+  enable_http2: true
+
+ui:
+  static_use_hash: true
+
+# 覆盖引擎配置 - 使用 disabled 属性
+engines:
+  # 主要搜索引擎
+  # Google 引擎 - 通过 SEARXNG_DEFAULT_LANG 环境变量修复语言代码问题
+  - name: google
+    engine: google
+    shortcut: g
+    timeout: 10.0
+    disabled: false
+    base_url: https://www.google.com
+
+  - name: bing
+    engine: bing
+    shortcut: b
+    timeout: 15.0
+    disabled: false
+    base_url: https://www.bing.com
+    # 允许跟随重定向，避免 "1 redirects, maximum: 0" 警告
+    follow_redirects: true
+    # 降低请求频率，减少被拦截概率
+    interval: 2.0
+
+  - name: brave
+    engine: brave
+    shortcut: br
+    timeout: 10.0
+    disabled: true
+
+  - name: duckduckgo
+    engine: duckduckgo
+    shortcut: ddg
+    timeout: 10.0
+    disabled: true
+
+  - name: startpage
+    engine: startpage
+    shortcut: sp
+    timeout: 10.0
+    disabled: true
+
+  # 中文搜索引擎
+  - name: baidu
+    engine: baidu
+    shortcut: bd
+    timeout: 15.0
+    disabled: false
+    # 降低请求频率，减少 CAPTCHA 触发概率
+    interval: 3.0
+    # 使用国内镜像（如果可用）
+    base_url: https://www.baidu.com
+
+  - name: sogou
+    engine: sogou
+    shortcut: sg
+    timeout: 15.0
+    disabled: false
+    # 降低请求频率，减少 CAPTCHA 触发概率
+    interval: 3.0
+
+  # 知识类
+  - name: wikipedia
+    engine: wikipedia
+    shortcut: wp
+    timeout: 5.0
+    disabled: false
+
+  - name: wikidata
+    engine: wikidata
+    shortcut: wd
+    timeout: 5.0
+    disabled: false
+
+  # 更多国际搜索引擎
+  - name: yahoo
+    engine: yahoo
+    shortcut: yh
+    timeout: 10.0
+    disabled: false
+    base_url: https://search.yahoo.com
+
+  - name: qwant
+    engine: qwant
+    shortcut: qw
+    timeout: 10.0
+    disabled: false
+
+  - name: yandex
+    engine: yandex
+    shortcut: yx
+    timeout: 10.0
+    disabled: false
+    base_url: https://yandex.com
+
+  - name: mojeek
+    engine: mojeek
+    shortcut: mk
+    timeout: 10.0
+    disabled: false
+
+  # 技术/开发者搜索
+  - name: github
+    engine: github
+    shortcut: gh
+    timeout: 10.0
+    disabled: false
+
+  - name: gitlab
+    engine: gitlab
+    shortcut: gl
+    timeout: 10.0
+    disabled: false
+
+  # 学术搜索
+  - name: arxiv
+    engine: arxiv
+    shortcut: ar
+    timeout: 10.0
+    disabled: false
+
+  # 其他搜索
+  - name: apkmirror
+    engine: apkmirror
+    shortcut: ap
+    timeout: 10.0
+    disabled: false
+
+  - name: brilliant
+    engine: brilliant
+    shortcut: brl
+    timeout: 10.0
+    disabled: false
+
+  # 其他中文搜索引擎
+  - name: 360search
+    engine: 360search
+    shortcut: 360
+    timeout: 15.0
+    disabled: false
+    interval: 3.0

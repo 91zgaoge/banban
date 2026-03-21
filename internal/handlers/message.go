@@ -1,0 +1,637 @@
+package handlers
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/labstack/echo/v4"
+
+	"github.com/Kxiandaoyan/Memoh-v2/internal/accounts"
+	"github.com/Kxiandaoyan/Memoh-v2/internal/bots"
+	"github.com/Kxiandaoyan/Memoh-v2/internal/channel/identities"
+	"github.com/Kxiandaoyan/Memoh-v2/internal/conversation"
+	"github.com/Kxiandaoyan/Memoh-v2/internal/conversation/flow"
+	"github.com/Kxiandaoyan/Memoh-v2/internal/fileparse"
+	messagepkg "github.com/Kxiandaoyan/Memoh-v2/internal/message"
+	messageevent "github.com/Kxiandaoyan/Memoh-v2/internal/message/event"
+)
+
+// MessageHandler handles bot-scoped messaging endpoints.
+type MessageHandler struct {
+	runner              flow.Runner
+	conversationService conversation.Accessor
+	messageService      messagepkg.Service
+	messageEvents       messageevent.Subscriber
+	botService          *bots.Service
+	accountService      *accounts.Service
+	channelIdentitySvc  *identities.Service
+	logger              *slog.Logger
+	dataRoot            string // root directory for shared file storage
+}
+
+// NewMessageHandler creates a MessageHandler.
+func NewMessageHandler(log *slog.Logger, runner flow.Runner, conversationService conversation.Accessor, messageService messagepkg.Service, botService *bots.Service, accountService *accounts.Service, channelIdentitySvc *identities.Service, dataRoot string, eventSubscribers ...messageevent.Subscriber) *MessageHandler {
+	var messageEvents messageevent.Subscriber
+	if len(eventSubscribers) > 0 {
+		messageEvents = eventSubscribers[0]
+	}
+	return &MessageHandler{
+		runner:              runner,
+		conversationService: conversationService,
+		messageService:      messageService,
+		messageEvents:       messageEvents,
+		botService:          botService,
+		accountService:      accountService,
+		channelIdentitySvc:  channelIdentitySvc,
+		logger:              log.With(slog.String("handler", "conversation")),
+		dataRoot:            dataRoot,
+	}
+}
+
+// Register registers all conversation routes.
+func (h *MessageHandler) Register(e *echo.Echo) {
+	// Bot-scoped message container (single shared history per bot).
+	botGroup := e.Group("/bots/:bot_id")
+	botGroup.POST("/messages", h.SendMessage)
+	botGroup.POST("/messages/stream", h.StreamMessage)
+	botGroup.GET("/messages", h.ListMessages)
+	botGroup.GET("/messages/events", h.StreamMessageEvents)
+	botGroup.DELETE("/messages", h.DeleteMessages)
+}
+
+// --- Messages ---
+
+// bindChatRequest validates auth, binds the request body, and fills common fields.
+func (h *MessageHandler) bindChatRequest(c echo.Context) (conversation.ChatRequest, error) {
+	channelIdentityID, err := h.requireChannelIdentityID(c)
+	if err != nil {
+		return conversation.ChatRequest{}, err
+	}
+	botID := strings.TrimSpace(c.Param("bot_id"))
+	if botID == "" {
+		return conversation.ChatRequest{}, echo.NewHTTPError(http.StatusBadRequest, "bot id is required")
+	}
+	if _, err := h.authorizeBotAccess(c.Request().Context(), channelIdentityID, botID); err != nil {
+		return conversation.ChatRequest{}, err
+	}
+	if err := h.requireParticipant(c.Request().Context(), botID, channelIdentityID); err != nil {
+		return conversation.ChatRequest{}, err
+	}
+
+	var req conversation.ChatRequest
+	if err := c.Bind(&req); err != nil {
+		return conversation.ChatRequest{}, echo.NewHTTPError(http.StatusBadRequest, "invalid request body")
+	}
+	if req.Query == "" {
+		return conversation.ChatRequest{}, echo.NewHTTPError(http.StatusBadRequest, "query is required")
+	}
+	req.BotID = botID
+	req.ChatID = botID
+	req.Token = c.Request().Header.Get("Authorization")
+	req.UserID = channelIdentityID
+	req.SourceChannelIdentityID = channelIdentityID
+	if strings.TrimSpace(req.CurrentChannel) == "" {
+		req.CurrentChannel = "web"
+	}
+	if strings.TrimSpace(req.ConversationType) == "" {
+		req.ConversationType = "direct"
+	}
+	if len(req.Channels) == 0 {
+		req.Channels = []string{req.CurrentChannel}
+	}
+	h.resolveWebChannelIdentity(c.Request().Context(), channelIdentityID, &req)
+
+	// Convert file refs to input attachments and inject file context into query.
+	if len(req.FileRefs) > 0 {
+		var fileContext strings.Builder
+		fileContext.WriteString("\n\n[Attached files]\n")
+		for _, f := range req.FileRefs {
+			// Images: keep as file attachment (agent gateway handles image parts).
+			if isImageMime(f.Mime) {
+				req.InputAttachments = append(req.InputAttachments, conversation.InputAttachment{
+					Type: "file",
+					Path: f.Path,
+				})
+				fileContext.WriteString(fmt.Sprintf("- %s (%s, %d bytes) → %s [image]\n", f.Name, f.Mime, f.Size, f.Path))
+				continue
+			}
+			// Documents: extract text and inline into query.
+			absPath := h.resolveSharedFilePath(channelIdentityID, f.Path)
+			text, err := fileparse.ExtractText(absPath, f.Mime)
+			if err != nil || text == "" {
+				// Parse failed — fall back to path reference so agent can try read tool.
+				req.InputAttachments = append(req.InputAttachments, conversation.InputAttachment{
+					Type: "file",
+					Path: f.Path,
+				})
+				fileContext.WriteString(fmt.Sprintf("- %s (%s, %d bytes) → %s [parse failed]\n", f.Name, f.Mime, f.Size, f.Path))
+			} else {
+				fileContext.WriteString(fmt.Sprintf("\n### File: %s\n```\n%s\n```\n", f.Name, text))
+			}
+		}
+		req.Query = req.Query + fileContext.String()
+	}
+
+	return req, nil
+}
+
+// SendMessage sends a synchronous conversation message.
+func (h *MessageHandler) SendMessage(c echo.Context) error {
+	req, err := h.bindChatRequest(c)
+	if err != nil {
+		return err
+	}
+
+	if h.runner == nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "conversation runner not configured")
+	}
+	resp, err := h.runner.Chat(c.Request().Context(), req)
+	if err != nil {
+		h.logger.Error("chat failed", slog.Any("error", err))
+		return echo.NewHTTPError(http.StatusInternalServerError, "conversation failed")
+	}
+	return c.JSON(http.StatusOK, resp)
+}
+
+// StreamMessage sends a streaming conversation message.
+func (h *MessageHandler) StreamMessage(c echo.Context) error {
+	req, err := h.bindChatRequest(c)
+	if err != nil {
+		return err
+	}
+
+	if h.runner == nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "conversation runner not configured")
+	}
+	c.Response().Header().Set(echo.HeaderContentType, "text/event-stream")
+	c.Response().Header().Set(echo.HeaderCacheControl, "no-cache")
+	c.Response().Header().Set(echo.HeaderConnection, "keep-alive")
+	c.Response().Header().Set("X-Accel-Buffering", "no")
+	c.Response().WriteHeader(http.StatusOK)
+
+	chunkChan, errChan := h.runner.StreamChat(c.Request().Context(), req)
+	flusher, ok := c.Response().Writer.(http.Flusher)
+	if !ok {
+		return echo.NewHTTPError(http.StatusInternalServerError, "streaming not supported")
+	}
+	w := c.Response()
+	processingState := "started"
+	if err := writeSSEJSON(w, flusher, map[string]string{"type": "processing_started"}); err != nil {
+		return nil
+	}
+
+	// sendStreamError writes a classified error event and [DONE] to the client.
+	sendStreamError := func(streamErr error) {
+		h.logger.Error("conversation stream failed", slog.Any("error", streamErr))
+		if processingState == "started" {
+			processingState = "failed"
+			writeSSEJSON(w, flusher, map[string]string{
+				"type":  "processing_failed",
+				"error": "conversation processing failed",
+			})
+		}
+		errCode := classifyStreamError(streamErr)
+		writeSSEJSON(w, flusher, map[string]string{
+			"type":  "error",
+			"error": errCode,
+		})
+		writeSSEData(w, flusher, "[DONE]")
+	}
+
+	ctx := c.Request().Context()
+	heartbeat := time.NewTicker(15 * time.Second)
+	defer heartbeat.Stop()
+	for chunkChan != nil || errChan != nil {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-heartbeat.C:
+			if err := writeSSEData(w, flusher, `{"type":"ping"}`); err != nil {
+				return nil
+			}
+		case chunk, ok := <-chunkChan:
+			if !ok {
+				chunkChan = nil
+				// After chunkChan closes, briefly wait for errChan to see if the
+				// stream ended with an error (e.g. idle timeout). Without this,
+				// the frontend would receive a normal [DONE] even on failure.
+				select {
+				case streamErr, errOk := <-errChan:
+					errChan = nil
+					if errOk && streamErr != nil {
+						sendStreamError(streamErr)
+						return nil
+					}
+				case <-time.After(500 * time.Millisecond):
+					// No error within 500ms — treat as normal completion.
+				}
+				if processingState == "started" {
+					processingState = "completed"
+					if err := writeSSEJSON(w, flusher, map[string]string{"type": "processing_completed"}); err != nil {
+						return nil
+					}
+				}
+				writeSSEData(w, flusher, "[DONE]")
+				return nil
+			}
+			if processingState == "started" {
+				processingState = "completed"
+				if err := writeSSEJSON(w, flusher, map[string]string{"type": "processing_completed"}); err != nil {
+					return nil
+				}
+			}
+			if err := writeSSEData(w, flusher, string(chunk)); err != nil {
+				return nil
+			}
+		case err, ok := <-errChan:
+			if !ok {
+				errChan = nil
+				continue
+			}
+			if err != nil {
+				sendStreamError(err)
+				return nil
+			}
+		}
+	}
+	return nil
+}
+
+func writeSSEData(w io.Writer, flusher http.Flusher, payload string) error {
+	if _, err := fmt.Fprintf(w, "data: %s\n\n", payload); err != nil {
+		return err
+	}
+	flusher.Flush()
+	return nil
+}
+
+func writeSSEJSON(w io.Writer, flusher http.Flusher, payload any) error {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	return writeSSEData(w, flusher, string(data))
+}
+
+// classifyStreamError maps internal errors to client-safe error codes.
+func classifyStreamError(err error) string {
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "timed out"):
+		return "stream_timeout"
+	case strings.Contains(msg, "connection lost"):
+		return "connection_lost"
+	case strings.Contains(msg, "interrupted"):
+		return "stream_interrupted"
+	case strings.Contains(msg, "agent gateway error"):
+		return "gateway_error"
+	default:
+		return "conversation_failed"
+	}
+}
+
+func parseSinceParam(raw string) (time.Time, bool, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return time.Time{}, false, nil
+	}
+	layouts := []string{time.RFC3339Nano, time.RFC3339}
+	for _, layout := range layouts {
+		parsed, err := time.Parse(layout, trimmed)
+		if err == nil {
+			return parsed.UTC(), true, nil
+		}
+	}
+	if epochMillis, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
+		return time.UnixMilli(epochMillis).UTC(), true, nil
+	}
+	return time.Time{}, false, fmt.Errorf("invalid since parameter")
+}
+
+// ListMessages godoc
+// @Summary List bot history messages
+// @Description List messages for a bot history with optional pagination
+// @Tags messages
+// @Produce json
+// @Param bot_id path string true "Bot ID"
+// @Param limit query int false "Limit"
+// @Param before query string false "Before"
+// @Success 200 {object} map[string][]messagepkg.Message
+// @Failure 400 {object} ErrorResponse
+// @Failure 403 {object} ErrorResponse
+// @Failure 500 {object} ErrorResponse
+// @Router /bots/{bot_id}/messages [get]
+func (h *MessageHandler) ListMessages(c echo.Context) error {
+	channelIdentityID, err := h.requireChannelIdentityID(c)
+	if err != nil {
+		return err
+	}
+	botID := strings.TrimSpace(c.Param("bot_id"))
+	if botID == "" {
+		return echo.NewHTTPError(http.StatusBadRequest, "bot id is required")
+	}
+	if _, err := h.authorizeBotAccess(c.Request().Context(), channelIdentityID, botID); err != nil {
+		return err
+	}
+	if err := h.requireReadable(c.Request().Context(), botID, channelIdentityID); err != nil {
+		return err
+	}
+
+	if h.messageService == nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "message service not configured")
+	}
+
+	limit := int32(30)
+	if s := strings.TrimSpace(c.QueryParam("limit")); s != "" {
+		if n, err := strconv.ParseInt(s, 10, 32); err == nil && n > 0 && n <= 100 {
+			limit = int32(n)
+		}
+	}
+
+	before, hasBefore := parseBeforeParam(c.QueryParam("before"))
+
+	var messages []messagepkg.Message
+	if hasBefore {
+		messages, err = h.messageService.ListBefore(c.Request().Context(), botID, before, limit)
+	} else {
+		messages, err = h.messageService.ListLatest(c.Request().Context(), botID, limit)
+		if err == nil {
+			reverseMessages(messages)
+		}
+	}
+	if err != nil {
+		h.logger.Error("list messages failed", slog.Any("error", err))
+		return echo.NewHTTPError(http.StatusInternalServerError, "failed to list messages")
+	}
+	return c.JSON(http.StatusOK, map[string]any{"items": messages})
+}
+
+func parseBeforeParam(s string) (time.Time, bool) {
+	trimmed := strings.TrimSpace(s)
+	if trimmed == "" {
+		return time.Time{}, false
+	}
+	if t, err := time.Parse(time.RFC3339Nano, trimmed); err == nil {
+		return t.UTC(), true
+	}
+	if t, err := time.Parse(time.RFC3339, trimmed); err == nil {
+		return t.UTC(), true
+	}
+	if epochMillis, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
+		return time.UnixMilli(epochMillis).UTC(), true
+	}
+	return time.Time{}, false
+}
+
+func reverseMessages(m []messagepkg.Message) {
+	for i, j := 0, len(m)-1; i < j; i, j = i+1, j-1 {
+		m[i], m[j] = m[j], m[i]
+	}
+}
+
+// StreamMessageEvents streams bot-scoped message events to clients.
+func (h *MessageHandler) StreamMessageEvents(c echo.Context) error {
+	channelIdentityID, err := h.requireChannelIdentityID(c)
+	if err != nil {
+		return err
+	}
+	botID := strings.TrimSpace(c.Param("bot_id"))
+	if botID == "" {
+		return echo.NewHTTPError(http.StatusBadRequest, "bot id is required")
+	}
+	if _, err := h.authorizeBotAccess(c.Request().Context(), channelIdentityID, botID); err != nil {
+		return err
+	}
+	if err := h.requireReadable(c.Request().Context(), botID, channelIdentityID); err != nil {
+		return err
+	}
+	if h.messageService == nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "message service not configured")
+	}
+	if h.messageEvents == nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "message events not configured")
+	}
+
+	since, hasSince, err := parseSinceParam(c.QueryParam("since"))
+	if err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+	}
+
+	c.Response().Header().Set(echo.HeaderContentType, "text/event-stream")
+	c.Response().Header().Set(echo.HeaderCacheControl, "no-cache")
+	c.Response().Header().Set(echo.HeaderConnection, "keep-alive")
+	c.Response().Header().Set("X-Accel-Buffering", "no")
+	c.Response().WriteHeader(http.StatusOK)
+
+	flusher, ok := c.Response().Writer.(http.Flusher)
+	if !ok {
+		return echo.NewHTTPError(http.StatusInternalServerError, "streaming not supported")
+	}
+	w := c.Response()
+
+	sentMessageIDs := map[string]struct{}{}
+	writeCreatedEvent := func(message messagepkg.Message) error {
+		msgID := strings.TrimSpace(message.ID)
+		if msgID != "" {
+			if _, exists := sentMessageIDs[msgID]; exists {
+				return nil
+			}
+			sentMessageIDs[msgID] = struct{}{}
+		}
+		return writeSSEJSON(w, flusher, map[string]any{
+			"type":    string(messageevent.EventTypeMessageCreated),
+			"bot_id":  botID,
+			"message": message,
+		})
+	}
+
+	_, stream, cancel := h.messageEvents.Subscribe(botID, 128)
+	defer cancel()
+
+	if hasSince {
+		backlog, err := h.messageService.ListSince(c.Request().Context(), botID, since)
+		if err != nil {
+			h.logger.Error("list messages since failed", slog.Any("error", err))
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to load message backlog")
+		}
+		for _, message := range backlog {
+			if err := writeCreatedEvent(message); err != nil {
+				return nil
+			}
+		}
+	}
+
+	heartbeatTicker := time.NewTicker(20 * time.Second)
+	defer heartbeatTicker.Stop()
+
+	for {
+		select {
+		case <-c.Request().Context().Done():
+			return nil
+		case <-heartbeatTicker.C:
+			if err := writeSSEJSON(w, flusher, map[string]any{"type": "ping"}); err != nil {
+				return nil
+			}
+		case event, ok := <-stream:
+			if !ok {
+				return nil
+			}
+			if strings.TrimSpace(event.BotID) != botID {
+				continue
+			}
+			if event.Type != messageevent.EventTypeMessageCreated {
+				continue
+			}
+			if len(event.Data) == 0 {
+				continue
+			}
+			var message messagepkg.Message
+			if err := json.Unmarshal(event.Data, &message); err != nil {
+				h.logger.Warn("decode message event failed", slog.Any("error", err))
+				continue
+			}
+			if err := writeCreatedEvent(message); err != nil {
+				return nil
+			}
+		}
+	}
+}
+
+// DeleteMessages clears all persisted bot-level history messages.
+func (h *MessageHandler) DeleteMessages(c echo.Context) error {
+	channelIdentityID, err := h.requireChannelIdentityID(c)
+	if err != nil {
+		return err
+	}
+	botID := strings.TrimSpace(c.Param("bot_id"))
+	if botID == "" {
+		return echo.NewHTTPError(http.StatusBadRequest, "bot id is required")
+	}
+	if _, err := h.authorizeBotManage(c.Request().Context(), channelIdentityID, botID); err != nil {
+		return err
+	}
+	if h.messageService == nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "message service not configured")
+	}
+	if err := h.messageService.DeleteByBot(c.Request().Context(), botID); err != nil {
+		h.logger.Error("delete messages failed", slog.Any("error", err))
+		return echo.NewHTTPError(http.StatusInternalServerError, "failed to delete messages")
+	}
+	return c.NoContent(http.StatusNoContent)
+}
+
+// --- helpers ---
+
+// resolveWebChannelIdentity resolves (web, user_id) to a channel identity and sets req.SourceChannelIdentityID.
+// Web uses user_id as the channel subject id (like Feishu open_id); the resolved ci has display_name and is linked to the user.
+// Returns the channel_identity_id to use for the rest of the flow, or the original userID if resolution is skipped/fails.
+func (h *MessageHandler) resolveWebChannelIdentity(ctx context.Context, userID string, req *conversation.ChatRequest) string {
+	if strings.TrimSpace(req.CurrentChannel) != "web" || h.channelIdentitySvc == nil || strings.TrimSpace(userID) == "" {
+		return userID
+	}
+	displayName := ""
+	if h.accountService != nil {
+		if account, err := h.accountService.Get(ctx, userID); err == nil {
+			displayName = strings.TrimSpace(account.DisplayName)
+			if displayName == "" {
+				displayName = strings.TrimSpace(account.Username)
+			}
+		}
+	}
+	ci, err := h.channelIdentitySvc.ResolveByChannelIdentity(ctx, "web", userID, displayName, nil)
+	if err != nil {
+		return userID
+	}
+	if err := h.channelIdentitySvc.LinkChannelIdentityToUser(ctx, ci.ID, userID); err != nil {
+		h.logger.Warn("link channel identity to user failed", slog.Any("error", err))
+	}
+	req.SourceChannelIdentityID = ci.ID
+	return ci.ID
+}
+
+func (h *MessageHandler) requireChannelIdentityID(c echo.Context) (string, error) {
+	return RequireChannelIdentityID(c)
+}
+
+func (h *MessageHandler) authorizeBotAccess(ctx context.Context, channelIdentityID, botID string) (bots.Bot, error) {
+	return AuthorizeBotAccess(ctx, h.botService, h.accountService, channelIdentityID, botID, bots.AccessPolicy{AllowPublicMember: true})
+}
+
+func (h *MessageHandler) authorizeBotManage(ctx context.Context, channelIdentityID, botID string) (bots.Bot, error) {
+	return AuthorizeBotAccess(ctx, h.botService, h.accountService, channelIdentityID, botID, bots.AccessPolicy{AllowPublicMember: false})
+}
+
+func (h *MessageHandler) requireParticipant(ctx context.Context, conversationID, channelIdentityID string) error {
+	if h.conversationService == nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "conversation service not configured")
+	}
+	if h.accountService != nil {
+		isAdmin, err := h.accountService.IsAdmin(ctx, channelIdentityID)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to check permissions")
+		}
+		if isAdmin {
+			return nil
+		}
+	}
+	ok, err := h.conversationService.IsParticipant(ctx, conversationID, channelIdentityID)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "failed to check participation")
+	}
+	if !ok {
+		return echo.NewHTTPError(http.StatusForbidden, "not a participant")
+	}
+	return nil
+}
+
+// resolveSharedFilePath maps a virtual path like "/shared/uploads/xxx" to the
+// absolute disk path under dataRoot for the given user.
+func (h *MessageHandler) resolveSharedFilePath(userID, virtualPath string) string {
+	rel := strings.TrimPrefix(virtualPath, "/shared/")
+	root := h.dataRoot
+	if root == "" {
+		root = "data"
+	}
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		abs = root
+	}
+	return filepath.Join(abs, "shared", userID, rel)
+}
+
+// isImageMime returns true if the MIME type represents an image.
+func isImageMime(mime string) bool {
+	return strings.HasPrefix(strings.ToLower(mime), "image/")
+}
+
+func (h *MessageHandler) requireReadable(ctx context.Context, conversationID, channelIdentityID string) error {
+	if h.conversationService == nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "conversation service not configured")
+	}
+	if h.accountService != nil {
+		isAdmin, err := h.accountService.IsAdmin(ctx, channelIdentityID)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, "failed to check permissions")
+		}
+		if isAdmin {
+			return nil
+		}
+	}
+	_, err := h.conversationService.GetReadAccess(ctx, conversationID, channelIdentityID)
+	if err != nil {
+		if errors.Is(err, conversation.ErrPermissionDenied) {
+			return echo.NewHTTPError(http.StatusForbidden, "not allowed to read conversation")
+		}
+		return echo.NewHTTPError(http.StatusInternalServerError, "failed to check read access")
+	}
+	return nil
+}
