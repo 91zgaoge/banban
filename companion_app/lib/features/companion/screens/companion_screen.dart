@@ -57,12 +57,31 @@ class _CompanionScreenState extends State<CompanionScreen> {
   }
 
   Future<void> _onMicPressStart() async {
+    // Check/request permission first
     if (!_hasAudioPermission) {
       final granted = await _voiceRecorder.requestPermission();
-      if (!granted || !mounted) return;
+      if (!granted) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('需要麦克风权限才能录音')),
+          );
+        }
+        return;
+      }
       setState(() => _hasAudioPermission = true);
     }
-    await _voiceRecorder.start();
+
+    // Try to start recording
+    final started = await _voiceRecorder.start();
+    if (!started) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('无法启动录音，请检查权限')),
+        );
+      }
+      return;
+    }
+
     if (mounted) {
       context.read<CompanionBloc>().add(const VoiceRecordStarted());
     }
