@@ -1,0 +1,42 @@
+name: companion_app
+description: 伴伴 — 你的 AI 陪伴伴侣
+
+publish_to: 'none'
+
+version: 0.1.0+1
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # State management
+  flutter_bloc: ^8.1.6
+  equatable: ^2.0.5
+
+  # Routing
+  go_router: ^14.0.0
+
+  # HTTP & WebSocket
+  dio: ^5.7.0
+  web_socket_channel: ^3.0.0
+
+  # Secure storage (JWT)
+  flutter_secure_storage: ^9.2.2
+
+  # DI
+  get_it: ^8.0.0
+
+  # Utils
+  uuid: ^4.4.2
+  intl: ^0.19.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true

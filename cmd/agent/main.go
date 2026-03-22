@@ -25,6 +25,7 @@ import (
 	"github.com/Kxiandaoyan/Memoh-v2/internal/bots"
 	"github.com/Kxiandaoyan/Memoh-v2/internal/channel"
 	// "github.com/Kxiandaoyan/Memoh-v2/internal/channel/adapters/discord"
+	"github.com/Kxiandaoyan/Memoh-v2/internal/channel/adapters/companion"
 	"github.com/Kxiandaoyan/Memoh-v2/internal/channel/adapters/feishu"
 	"github.com/Kxiandaoyan/Memoh-v2/internal/channel/adapters/local"
 	// _ "github.com/Kxiandaoyan/Memoh-v2/internal/channel/adapters/qq"
@@ -75,6 +76,8 @@ import (
 	"github.com/Kxiandaoyan/Memoh-v2/internal/searchproviders"
 	"github.com/Kxiandaoyan/Memoh-v2/internal/server"
 	"github.com/Kxiandaoyan/Memoh-v2/internal/settings"
+	"github.com/Kxiandaoyan/Memoh-v2/internal/stt"
+	"github.com/Kxiandaoyan/Memoh-v2/internal/tts"
 	"github.com/Kxiandaoyan/Memoh-v2/internal/subagent"
 	"github.com/Kxiandaoyan/Memoh-v2/internal/templates"
 	"github.com/Kxiandaoyan/Memoh-v2/internal/version"
@@ -132,10 +135,18 @@ func main() {
 
 			// channel infrastructure
 			local.NewRouteHub,
+			companion.NewSessionHub,
+			companion.NewIndexer,
 			provideChannelRegistry,
 			channel.NewService,
 			provideChannelRouter,
 			provideChannelManager,
+
+			// STT service for companion voice input
+			provideSTTService,
+
+			// TTS service for companion voice output
+			provideTTSService,
 
 			// process log service
 			provideProcessLogService,
@@ -186,6 +197,7 @@ func main() {
 			provideServerHandler(templates.NewHandler),
 			provideServerHandler(provideCLIHandler),
 			provideServerHandler(provideWebHandler),
+			provideServerHandler(provideCompanionHandler),
 			provideServerHandler(provideAgentCallHandler),
 			provideServerHandler(provideWeChatWebhookHandler),
 			provideServerHandler(provideTeamsHandler),
@@ -484,7 +496,7 @@ func provideChatResolver(log *slog.Logger, cfg config.Config, gs *globalsettings
 // channel providers
 // ---------------------------------------------------------------------------
 
-func provideChannelRegistry(log *slog.Logger, hub *local.RouteHub, msgService *message.DBService, routeService *route.DBService) *channel.Registry {
+func provideChannelRegistry(log *slog.Logger, hub *local.RouteHub, companionHub *companion.SessionHub, companionIndexer *companion.Indexer, ttsService tts.Service, msgService *message.DBService, routeService *route.DBService) *channel.Registry {
 	registry := channel.NewRegistry()
 	registry.MustRegister(telegram.NewTelegramAdapter(log))
 	registry.MustRegister(feishu.NewFeishuAdapter(log))
@@ -492,6 +504,7 @@ func provideChannelRegistry(log *slog.Logger, hub *local.RouteHub, msgService *m
 	registry.MustRegister(local.NewCLIAdapter(hub))
 	registry.MustRegister(local.NewWebAdapter(hub))
 	registry.MustRegister(wechat.NewWeChatAdapter(log))
+	registry.MustRegister(companion.NewAdapter(companionHub, companionIndexer, ttsService, "af_bella"))
 
 	// WeCom adapter with message/route services for per-route history clearing on "new chat" command.
 	wecomAdapter := wecom.NewWeComAdapter(log)
@@ -668,6 +681,24 @@ func provideCLIHandler(channelManager *channel.Manager, channelService *channel.
 
 func provideWebHandler(channelManager *channel.Manager, channelService *channel.Service, chatService *conversation.Service, hub *local.RouteHub, botService *bots.Service, accountService *accounts.Service) *handlers.LocalChannelHandler {
 	return handlers.NewLocalChannelHandler(local.WebType, channelManager, channelService, chatService, hub, botService, accountService)
+}
+
+func provideSTTService(log *slog.Logger) stt.Service {
+	return stt.NewFunASRClient(log, stt.FunASROptions{
+		Endpoint: "http://memoh-funasr:10095",
+		Timeout:  30 * time.Second,
+	})
+}
+
+func provideTTSService(log *slog.Logger) tts.Service {
+	return tts.NewKokoroClient(log, tts.KokoroOptions{
+		Endpoint: "http://memoh-kokoro-tts:8880",
+		Timeout:  30 * time.Second,
+	})
+}
+
+func provideCompanionHandler(log *slog.Logger, hub *companion.SessionHub, channelManager *channel.Manager, channelService *channel.Service, botService *bots.Service, accountService *accounts.Service, sttService stt.Service) *handlers.CompanionHandler {
+	return handlers.NewCompanionHandler(log, hub, channelManager, channelService, botService, accountService, sttService)
 }
 
 func provideAgentCallHandler(log *slog.Logger, botService *bots.Service, resolver *flow.Resolver) *handlers.AgentCallHandler {

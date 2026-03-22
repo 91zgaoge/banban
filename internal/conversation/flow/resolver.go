@@ -2564,6 +2564,48 @@ func (r *Resolver) loadMemoryContextMessage(ctx context.Context, req conversatio
 		results = append(results, memoryContextItem{Namespace: sharedMemoryNamespace, Item: item})
 	}
 
+	// Search companion namespace for companion channel conversations
+	if req.CurrentChannel == "companion" {
+		companionFilters := map[string]any{
+			"namespace": "companion",
+			"bot_id":    req.BotID,
+		}
+		// Add user_id filter for per-user memory isolation in companion mode
+		if strings.TrimSpace(req.UserID) != "" {
+			companionFilters["user_id"] = req.UserID
+		}
+		compResp, compErr := r.memoryService.Search(ctx, memory.SearchRequest{
+			Query:   req.Query,
+			BotID:   req.BotID,
+			UserID:  req.UserID,
+			Limit:   memoryContextLimitPerScope,
+			Filters: companionFilters,
+			NoStats: true,
+		})
+		if compErr == nil {
+			for _, item := range compResp.Results {
+				if item.Score < memoryMinScoreThreshold {
+					continue
+				}
+				key := strings.TrimSpace(item.ID)
+				if key == "" {
+					key = "companion:" + strings.TrimSpace(item.Memory)
+				}
+				if key == "" {
+					continue
+				}
+				if _, ok := seen[key]; ok {
+					continue
+				}
+				seen[key] = struct{}{}
+				results = append(results, memoryContextItem{
+					Namespace: "companion",
+					Item:      item,
+				})
+			}
+		}
+	}
+
 	// Search global SOLUTIONS area
 	solFilters := map[string]any{
 		"namespace": solutionsNamespace,
