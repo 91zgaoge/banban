@@ -89,7 +89,7 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y \
-            clang cmake ninja-build pkg-config \
+            clang cmake ninja-build pkg-config g++ \
             libgtk-3-dev liblzma-dev libstdc++-12-dev \
             libsecret-1-dev libjsoncpp-dev \
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
