@@ -1,0 +1,191 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  # ─── Android APK ────────────────────────────────────────────
+  build-android:
+    name: Android APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.27.x'
+          channel: stable
+          cache: true
+
+      - name: Flutter pub get
+        working-directory: companion_app
+        run: flutter pub get
+
+      - name: Build APK
+        working-directory: companion_app
+        run: flutter build apk --release
+
+      - name: Rename artifact
+        run: |
+          cp companion_app/build/app/outputs/flutter-apk/app-release.apk \
+             banban-${{ github.ref_name }}-android.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: banban-${{ github.ref_name }}-android.apk
+
+  # ─── Windows EXE ────────────────────────────────────────────
+  build-windows:
+    name: Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.27.x'
+          channel: stable
+          cache: true
+
+      - name: Flutter pub get
+        working-directory: companion_app
+        run: flutter pub get
+
+      - name: Build Windows
+        working-directory: companion_app
+        run: flutter build windows --release
+
+      - name: Package ZIP
+        shell: pwsh
+        run: |
+          Compress-Archive `
+            -Path "companion_app\build\windows\x64\runner\Release\*" `
+            -DestinationPath "banban-${{ github.ref_name }}-windows.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-zip
+          path: banban-${{ github.ref_name }}-windows.zip
+
+  # ─── Linux ──────────────────────────────────────────────────
+  build-linux:
+    name: Linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux build deps
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y \
+            clang cmake ninja-build pkg-config \
+            libgtk-3-dev liblzma-dev libstdc++-12-dev
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.27.x'
+          channel: stable
+          cache: true
+
+      - name: Flutter pub get
+        working-directory: companion_app
+        run: flutter pub get
+
+      - name: Build Linux
+        working-directory: companion_app
+        run: flutter build linux --release
+
+      - name: Package tar.gz
+        run: |
+          tar -czf banban-${{ github.ref_name }}-linux.tar.gz \
+            -C companion_app/build/linux/x64/release/bundle .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-tar
+          path: banban-${{ github.ref_name }}-linux.tar.gz
+
+  # ─── macOS ──────────────────────────────────────────────────
+  build-macos:
+    name: macOS
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.27.x'
+          channel: stable
+          cache: true
+
+      - name: Flutter pub get
+        working-directory: companion_app
+        run: flutter pub get
+
+      - name: Build macOS
+        working-directory: companion_app
+        run: flutter build macos --release
+
+      - name: Package ZIP
+        run: |
+          cd companion_app/build/macos/Build/Products/Release
+          zip -r "${{ github.workspace }}/banban-${{ github.ref_name }}-macos.zip" \
+            companion_app.app
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-zip
+          path: banban-${{ github.ref_name }}-macos.zip
+
+  # ─── Publish Release ────────────────────────────────────────
+  publish:
+    name: Publish Release
+    needs: [build-android, build-windows, build-linux, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh artifacts/
+
+      - name: Get CHANGELOG entry
+        id: changelog
+        run: |
+          # 提取当前版本的 CHANGELOG 内容
+          VERSION="${{ github.ref_name }}"
+          VERSION_CLEAN="${VERSION#v}"
+          NOTES=$(awk "/^## \[${VERSION_CLEAN}\]/{found=1; next} found && /^## \[/{exit} found{print}" CHANGELOG.md)
+          echo "notes<<EOF" >> $GITHUB_OUTPUT
+          echo "$NOTES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "💝 伴伴 ${{ github.ref_name }}"
+          body: ${{ steps.changelog.outputs.notes }}
+          files: |
+            artifacts/banban-${{ github.ref_name }}-android.apk
+            artifacts/banban-${{ github.ref_name }}-windows.zip
+            artifacts/banban-${{ github.ref_name }}-linux.tar.gz
+            artifacts/banban-${{ github.ref_name }}-macos.zip
+          draft: false
+          prerelease: false
