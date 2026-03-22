@@ -21,6 +21,11 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.14'
+
       - uses: subosito/flutter-action@v2
         with:
           flutter-version: '3.27.x'
@@ -31,16 +36,10 @@ jobs:
         working-directory: companion_app
         run: flutter pub get
 
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.14'
-          cache-read-only: false
-
       - name: Build APK
         working-directory: companion_app
         env:
-          GRADLE_OPTS: '-Dorg.gradle.daemon=false -Dorg.gradle.configureondemand=false'
+          GRADLE_OPTS: '-Dorg.gradle.daemon=false'
         run: flutter build apk --release
 
       - name: Rename artifact
