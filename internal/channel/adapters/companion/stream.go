@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -20,17 +21,21 @@ import (
 //	status     → {"type":"status","status":"thinking"}
 //	delta      → {"type":"delta","text":"..."}
 //	final      → {"type":"final","text":"...","duration_ms":N}
-//	tts_chunk  → {"type":"tts_chunk","audio":"base64...","seq":N}
+//	tts_chunk  → {"type":"tts_chunk","seq":N,"chunk":N,"audio":"base64..."}
+//	tts_done   → {"type":"tts_done","seq":N}
+//	tts_error  → {"type":"tts_error","seq":N,"message":"..."}
 //	error      → {"type":"error","message":"..."}
 //	pong       → {"type":"pong"}
+//	proactive  → {"type":"proactive","text":"..."}
 type wsFrame struct {
 	Type       string `json:"type"`
 	Status     string `json:"status,omitempty"`
 	Text       string `json:"text,omitempty"`
 	DurationMs int64  `json:"duration_ms,omitempty"`
 	Message    string `json:"message,omitempty"`
-	Audio      string `json:"audio,omitempty"`  // base64 encoded audio for tts_chunk
-	Seq        int    `json:"seq,omitempty"`    // sequence number for tts_chunk
+	Audio      string `json:"audio,omitempty"` // base64 encoded audio chunk
+	Seq        int32  `json:"seq,omitempty"`   // TTS sentence sequence number
+	Chunk      int    `json:"chunk,omitempty"` // chunk index within a sentence
 }
 
 // wsOutboundStream implements channel.OutboundStream by writing JSON frames
@@ -44,14 +49,14 @@ type wsFrame struct {
 //	StreamEventError   → wsFrame{type:"error",  message:...}
 type wsOutboundStream struct {
 	session          *Session
-	indexer          *Indexer        // optional; triggers async memory extraction on final
-	ttsService       tts.Service     // optional; TTS service for voice output
-	textBuf          strings.Builder // accumulates delta text for final message
+	indexer          *Indexer            // optional; triggers async memory extraction on final
+	ttsService       tts.Service         // optional; TTS service for voice output
+	textBuf          strings.Builder     // accumulates delta text for final message
 	sentenceSplitter *tts.SentenceSplitter
-	ttsSeq           int
+	ttsSeq           atomic.Int32        // atomic sentence sequence counter
 	voiceID          string
 	closed           atomic.Bool
-	receivedAt       int64 // unix ms when the inbound message was received
+	receivedAt       int64               // unix ms when the inbound message was received
 }
 
 func newWSOutboundStream(session *Session, indexer *Indexer, ttsService tts.Service, voiceID string, receivedAtMs int64) channel.OutboundStream {
@@ -90,11 +95,11 @@ func (s *wsOutboundStream) Push(ctx context.Context, event channel.StreamEvent) 
 		if event.Delta != "" {
 			s.textBuf.WriteString(event.Delta)
 		}
-		// Check for complete sentences and trigger TTS
+		// Check for complete sentences and trigger TTS.
 		if s.ttsService != nil && s.sentenceSplitter != nil {
-			sentences := s.sentenceSplitter.AddText(event.Delta)
-			for _, sentence := range sentences {
-				go s.synthesizeAndSend(sentence)
+			for _, sentence := range s.sentenceSplitter.AddText(event.Delta) {
+				seq := s.ttsSeq.Add(1)
+				go s.synthesizeAndSendStream(sentence, seq)
 			}
 		}
 		return s.session.WriteJSON(wsFrame{
@@ -107,25 +112,22 @@ func (s *wsOutboundStream) Push(ctx context.Context, event channel.StreamEvent) 
 		if event.Final != nil {
 			text = event.Final.Message.PlainText()
 		}
-		// If the final message is empty but we accumulated deltas, use that.
 		if text == "" && s.textBuf.Len() > 0 {
 			text = s.textBuf.String()
 		}
-		// Truncate to valid UTF-8 just in case.
 		text = toValidUTF8(text)
 		var durationMs int64
 		if s.receivedAt > 0 {
 			durationMs = time.Now().UnixMilli() - s.receivedAt
 		}
-		// Flush any remaining text for TTS
+		// Flush remaining text for TTS.
 		if s.ttsService != nil && s.sentenceSplitter != nil {
-			remaining := s.sentenceSplitter.Flush()
-			if remaining != "" {
-				go s.synthesizeAndSend(remaining)
+			if remaining := s.sentenceSplitter.Flush(); remaining != "" {
+				seq := s.ttsSeq.Add(1)
+				go s.synthesizeAndSendStream(remaining, seq)
 			}
 		}
-		// Asynchronously extract and store memories for this turn.
-		// Pass ctx so the goroutine inherits the preferred-model context value.
+		// Async memory extraction.
 		if s.indexer != nil {
 			s.indexer.IndexAsync(ctx, s.session.BotID, s.session.UserID, s.session.UserText, text)
 		}
@@ -144,8 +146,7 @@ func (s *wsOutboundStream) Push(ctx context.Context, event channel.StreamEvent) 
 	return nil
 }
 
-// Close marks the stream as closed. The WebSocket connection itself is managed
-// by the handler and is not closed here.
+// Close marks the stream as closed.
 func (s *wsOutboundStream) Close(_ context.Context) error {
 	s.closed.Store(true)
 	s.textBuf.Reset()
@@ -153,40 +154,69 @@ func (s *wsOutboundStream) Close(_ context.Context) error {
 }
 
 // toValidUTF8 removes invalid UTF-8 sequences.
-func toValidUTF8(s string) string {
-	if utf8.ValidString(s) {
-		return s
+func toValidUTF8(str string) string {
+	if utf8.ValidString(str) {
+		return str
 	}
 	var b strings.Builder
-	b.Grow(len(s))
-	for _, r := range s {
+	b.Grow(len(str))
+	for _, r := range str {
 		b.WriteRune(r)
 	}
 	return b.String()
 }
 
-// synthesizeAndSend performs TTS synthesis and sends the audio chunk to the client.
-func (s *wsOutboundStream) synthesizeAndSend(text string) {
+// synthesizeAndSendStream performs streaming TTS synthesis and pushes
+// audio chunks to the client as they arrive from Kokoro.
+// Chunks are sent with the format:
+//
+//	{"type":"tts_chunk","seq":N,"chunk":M,"audio":"<base64>"}
+//	{"type":"tts_done","seq":N}
+func (s *wsOutboundStream) synthesizeAndSendStream(text string, seq int32) {
 	if s.ttsService == nil || text == "" {
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	audioData, err := s.ttsService.Synthesize(ctx, text, s.voiceID)
+	reader, err := s.ttsService.SynthesizeStream(ctx, text, s.voiceID)
 	if err != nil {
-		// Log error but don't fail the stream
+		_ = s.session.WriteJSON(wsFrame{
+			Type:    "tts_error",
+			Seq:     seq,
+			Message: err.Error(),
+		})
 		return
 	}
+	defer reader.Close()
 
-	if len(audioData) == 0 {
-		return
+	const chunkSize = 4096
+	buf := make([]byte, chunkSize)
+	chunkIdx := 0
+
+	for {
+		n, readErr := reader.Read(buf)
+		if n > 0 {
+			_ = s.session.WriteJSON(wsFrame{
+				Type:  "tts_chunk",
+				Seq:   seq,
+				Chunk: chunkIdx,
+				Audio: base64.StdEncoding.EncodeToString(buf[:n]),
+			})
+			chunkIdx++
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			_ = s.session.WriteJSON(wsFrame{
+				Type:    "tts_error",
+				Seq:     seq,
+				Message: readErr.Error(),
+			})
+			return
+		}
 	}
 
-	s.ttsSeq++
-	s.session.WriteJSON(wsFrame{
-		Type:  "tts_chunk",
-		Audio: base64.StdEncoding.EncodeToString(audioData),
-		Seq:   s.ttsSeq,
-	})
+	_ = s.session.WriteJSON(wsFrame{Type: "tts_done", Seq: seq})
 }

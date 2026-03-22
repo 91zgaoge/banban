@@ -4,6 +4,7 @@ import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:uuid/uuid.dart';
 
 import '../../../core/api/websocket_client.dart';
+import '../../../core/audio/player.dart';
 import '../../../core/auth/secure_storage.dart';
 import '../models/chat_message.dart';
 import 'companion_event.dart';
@@ -23,12 +24,22 @@ const _uuid = Uuid();
 ///      ▼
 ///  [reconnecting] ──► [connected] (auto)
 ///
-/// Message flow:
+/// Message flow (text):
 ///  CompanionMessageSent → add user msg → sendText()
 ///  WsStatusEvent        → isAssistantTyping = true
 ///  WsDeltaEvent         → append delta to streaming msg
 ///  WsFinalEvent         → finalize msg, isAssistantTyping = false
 ///  WsErrorEvent         → show error msg
+///
+/// Message flow (voice / PTT):
+///  VoiceRecordStarted  → isRecording = true
+///  VoiceRecordStopped  → sendAudio() → isRecording = false
+///  WsTranscriptionEvent → add user bubble, clear transcriptionText
+///  (then same as text flow for assistant reply)
+///
+/// TTS playback:
+///  WsTtsChunkEvent → TtsPlayer.addChunk()
+///  WsTtsDoneEvent  → TtsPlayer.markDone() → isTtsPlaying = true
 class CompanionBloc extends Bloc<CompanionEvent, CompanionState> {
   CompanionBloc({
     required this.storage,
@@ -38,6 +49,9 @@ class CompanionBloc extends Bloc<CompanionEvent, CompanionState> {
     on<CompanionMessageSent>(_onMessageSent);
     on<CompanionWsEventReceived>(_onWsEvent);
     on<CompanionDisconnectRequested>(_onDisconnect);
+    on<VoiceRecordStarted>(_onVoiceRecordStarted);
+    on<VoiceRecordStopped>(_onVoiceRecordStopped);
+    on<VoiceRecordCancelled>(_onVoiceRecordCancelled);
   }
 
   final SecureStorageService storage;
@@ -45,6 +59,7 @@ class CompanionBloc extends Bloc<CompanionEvent, CompanionState> {
 
   CompanionWebSocketClient? _client;
   StreamSubscription? _eventSub;
+  final _ttsPlayer = TtsPlayer();
 
   // Tracks the id of the currently streaming assistant message.
   String? _streamingMsgId;
@@ -91,6 +106,31 @@ class CompanionBloc extends Bloc<CompanionEvent, CompanionState> {
     _client!.sendText(text);
   }
 
+  void _onVoiceRecordStarted(
+    VoiceRecordStarted event,
+    Emitter<CompanionState> emit,
+  ) {
+    emit(state.copyWith(isRecording: true, clearError: true));
+  }
+
+  void _onVoiceRecordStopped(
+    VoiceRecordStopped event,
+    Emitter<CompanionState> emit,
+  ) {
+    emit(state.copyWith(isRecording: false));
+    if (_client == null || event.audioBytes.isEmpty) return;
+    // Stop any in-flight TTS and send audio to server.
+    _ttsPlayer.stop();
+    _client!.sendAudio(event.audioBytes, codec: 'opus', isFinal: true);
+  }
+
+  void _onVoiceRecordCancelled(
+    VoiceRecordCancelled event,
+    Emitter<CompanionState> emit,
+  ) {
+    emit(state.copyWith(isRecording: false));
+  }
+
   void _onWsEvent(
     CompanionWsEventReceived event,
     Emitter<CompanionState> emit,
@@ -101,9 +141,7 @@ class CompanionBloc extends Bloc<CompanionEvent, CompanionState> {
         emit(state.copyWith(connectionStatus: ConnectionStatus.connected));
 
       case WsDisconnectedEvent():
-        emit(state.copyWith(
-          connectionStatus: ConnectionStatus.reconnecting,
-        ));
+        emit(state.copyWith(connectionStatus: ConnectionStatus.reconnecting));
 
       case WsStatusEvent(:final status):
         if (status == 'thinking') {
@@ -154,17 +192,57 @@ class CompanionBloc extends Bloc<CompanionEvent, CompanionState> {
           return m;
         }).toList();
         _streamingMsgId = null;
-        emit(state.copyWith(messages: msgs, isAssistantTyping: false));
+        emit(state.copyWith(
+          messages: msgs,
+          isAssistantTyping: false,
+          clearTranscription: true,
+        ));
 
       case WsErrorEvent(:final message):
         _streamingMsgId = null;
-        emit(state.copyWith(
-          isAssistantTyping: false,
-          errorMessage: message,
-        ));
+        emit(state.copyWith(isAssistantTyping: false, errorMessage: message));
 
       case WsPongEvent():
-        break; // heartbeat ack — no UI update needed
+        break; // heartbeat ack
+
+      case WsTranscriptionEvent(:final text):
+        // Add a user bubble with the recognised speech text.
+        if (text.isNotEmpty) {
+          final msg = ChatMessage(
+            id: _uuid.v4(),
+            role: MessageRole.user,
+            text: text,
+            status: MessageStatus.complete,
+            createdAt: DateTime.now(),
+          );
+          emit(state.copyWith(
+            messages: [...state.messages, msg],
+            transcriptionText: text,
+          ));
+        }
+
+      case WsTtsChunkEvent(:final seq, :final audio):
+        _ttsPlayer.addChunk(seq, audio);
+
+      case WsTtsDoneEvent(:final seq):
+        _ttsPlayer.markDone(seq);
+        emit(state.copyWith(isTtsPlaying: true));
+
+      case WsTtsErrorEvent():
+        // Ignore TTS errors silently (text is still shown).
+        break;
+
+      case WsProactiveEvent(:final text):
+        if (text.isNotEmpty) {
+          final msg = ChatMessage(
+            id: _uuid.v4(),
+            role: MessageRole.assistant,
+            text: text,
+            status: MessageStatus.complete,
+            createdAt: DateTime.now(),
+          );
+          emit(state.copyWith(messages: [...state.messages, msg]));
+        }
     }
   }
 
@@ -194,6 +272,7 @@ class CompanionBloc extends Bloc<CompanionEvent, CompanionState> {
   @override
   Future<void> close() {
     _disposeClient();
+    _ttsPlayer.dispose();
     return super.close();
   }
 }

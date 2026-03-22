@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
+import 'dart:typed_data';
 
 import 'package:web_socket_channel/web_socket_channel.dart';
 
@@ -35,6 +36,39 @@ class WsConnectedEvent extends WsEvent {}
 class WsDisconnectedEvent extends WsEvent {
   WsDisconnectedEvent({this.willReconnect = true});
   final bool willReconnect;
+}
+
+/// Received when STT transcription completes — echoes the recognised text.
+class WsTranscriptionEvent extends WsEvent {
+  WsTranscriptionEvent(this.text);
+  final String text;
+}
+
+/// An incremental TTS audio chunk for [seq].
+class WsTtsChunkEvent extends WsEvent {
+  WsTtsChunkEvent({required this.seq, required this.chunk, required this.audio});
+  final int seq;
+  final int chunk;
+  final Uint8List audio; // decoded WAV bytes
+}
+
+/// All chunks for [seq] have been sent; the sentence audio is complete.
+class WsTtsDoneEvent extends WsEvent {
+  WsTtsDoneEvent(this.seq);
+  final int seq;
+}
+
+/// TTS synthesis error for [seq].
+class WsTtsErrorEvent extends WsEvent {
+  WsTtsErrorEvent({required this.seq, required this.message});
+  final int seq;
+  final String message;
+}
+
+/// A proactive message pushed by the server without user input.
+class WsProactiveEvent extends WsEvent {
+  WsProactiveEvent(this.text);
+  final String text;
 }
 
 /// Manages a single WebSocket connection to the companion backend.
@@ -112,6 +146,29 @@ class CompanionWebSocketClient {
         _controller.add(WsErrorEvent(frame['message'] as String? ?? 'unknown error'));
       case 'pong':
         _controller.add(WsPongEvent());
+      case 'transcription':
+        _controller.add(WsTranscriptionEvent(frame['text'] as String? ?? ''));
+      case 'tts_chunk':
+        final audioB64 = frame['audio'] as String? ?? '';
+        if (audioB64.isNotEmpty) {
+          try {
+            final bytes = base64Decode(audioB64);
+            _controller.add(WsTtsChunkEvent(
+              seq: (frame['seq'] as num?)?.toInt() ?? 0,
+              chunk: (frame['chunk'] as num?)?.toInt() ?? 0,
+              audio: bytes,
+            ));
+          } catch (_) {}
+        }
+      case 'tts_done':
+        _controller.add(WsTtsDoneEvent((frame['seq'] as num?)?.toInt() ?? 0));
+      case 'tts_error':
+        _controller.add(WsTtsErrorEvent(
+          seq: (frame['seq'] as num?)?.toInt() ?? 0,
+          message: frame['message'] as String? ?? 'tts error',
+        ));
+      case 'proactive':
+        _controller.add(WsProactiveEvent(frame['text'] as String? ?? ''));
       default:
         break;
     }
@@ -157,6 +214,17 @@ class CompanionWebSocketClient {
   /// Send a text message to the companion.
   void sendText(String text) {
     _send({'type': 'input_text', 'text': text});
+  }
+
+  /// Send an audio chunk (Opus bytes, base64-encoded).
+  void sendAudio(List<int> audioBytes, {String codec = 'opus', int seq = 0, bool isFinal = true}) {
+    _send({
+      'type': 'input_audio',
+      'codec': codec,
+      'data': base64Encode(audioBytes),
+      'seq': seq,
+      'is_final': isFinal,
+    });
   }
 
   /// Send a ping frame.

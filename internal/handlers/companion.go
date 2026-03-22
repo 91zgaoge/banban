@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"log/slog"
@@ -29,14 +30,16 @@ var companionUpgrader = websocket.Upgrader{
 // wsInboundFrame is the JSON frame received from the Flutter client.
 //
 //	{"type":"input_text","text":"今天好累"}
-//	{"type":"input_audio","codec":"opus","data":"base64..."}
+//	{"type":"input_audio","codec":"opus","data":"base64...","seq":1,"is_final":true}
 //	{"type":"abort"}
 //	{"type":"ping"}
 type wsInboundFrame struct {
-	Type   string `json:"type"`
-	Text   string `json:"text,omitempty"`
-	Codec  string `json:"codec,omitempty"`  // for input_audio: opus, pcm, wav
-	Data   string `json:"data,omitempty"`   // for input_audio: base64 encoded audio
+	Type    string `json:"type"`
+	Text    string `json:"text,omitempty"`
+	Codec   string `json:"codec,omitempty"`    // for input_audio: opus, pcm, wav
+	Data    string `json:"data,omitempty"`     // for input_audio: base64 encoded audio
+	Seq     int    `json:"seq,omitempty"`      // audio frame sequence number
+	IsFinal bool   `json:"is_final,omitempty"` // true = last audio chunk (PTT release)
 }
 
 // CompanionHandler handles the companion WebSocket endpoint.
@@ -79,7 +82,6 @@ func (h *CompanionHandler) Register(e *echo.Echo) {
 // HandleWS upgrades the HTTP connection to WebSocket, registers the session,
 // and processes inbound frames until the connection closes.
 func (h *CompanionHandler) HandleWS(c echo.Context) error {
-	// Auth is handled by the JWT middleware (query:token or Bearer header).
 	userID, err := RequireChannelIdentityID(c)
 	if err != nil {
 		return err
@@ -98,16 +100,17 @@ func (h *CompanionHandler) HandleWS(c echo.Context) error {
 	conn, err := companionUpgrader.Upgrade(c.Response(), c.Request(), nil)
 	if err != nil {
 		h.log.Error("ws upgrade failed", slog.String("error", err.Error()))
-		return nil // upgrader already wrote error response
+		return nil
 	}
 	defer conn.Close()
 
 	sessionID := uuid.New().String()
 	session := &companionadapter.Session{
-		ID:     sessionID,
-		BotID:  botID,
-		UserID: userID,
-		Conn:   conn,
+		ID:           sessionID,
+		BotID:        botID,
+		UserID:       userID,
+		Conn:         conn,
+		LastActiveAt: time.Now(),
 	}
 	h.hub.Register(session)
 	defer h.hub.Unregister(sessionID)
@@ -124,11 +127,31 @@ func (h *CompanionHandler) HandleWS(c echo.Context) error {
 		cfg = channel.ChannelConfig{}
 	}
 
-	conn.SetReadLimit(512 * 1024) // 512 KB max frame
+	conn.SetReadLimit(512 * 1024)
 	conn.SetPongHandler(func(string) error {
 		_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 		return nil
 	})
+
+	// reqCtx is the per-request context. It is cancelled when an "abort" frame
+	// arrives so that in-flight HandleInbound calls are terminated cleanly.
+	var (
+		reqCtx    context.Context
+		reqCancel context.CancelFunc
+	)
+	newReqCtx := func() context.Context {
+		if reqCancel != nil {
+			reqCancel()
+		}
+		reqCtx, reqCancel = context.WithCancel(c.Request().Context())
+		session.CancelFn = reqCancel
+		return reqCtx
+	}
+	defer func() {
+		if reqCancel != nil {
+			reqCancel()
+		}
+	}()
 
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
@@ -158,129 +181,79 @@ func (h *CompanionHandler) HandleWS(c echo.Context) error {
 			if text == "" {
 				continue
 			}
-			// Store user text on the session so the outbound stream can pass it
-			// to the memory indexer after StreamEventFinal fires.
 			session.UserText = text
+			session.Touch()
+			ctx := newReqCtx()
 			receivedAt := time.Now().UTC()
-			msg := channel.InboundMessage{
-				Channel: companionadapter.CompanionType,
-				Message: channel.Message{
-					Parts: []channel.MessagePart{{Type: channel.MessagePartText, Text: text}},
-				},
-				BotID:       botID,
-				ReplyTarget: sessionID,
-				RouteKey:    sessionID,
-				Sender: channel.Identity{
-					SubjectID: userID,
-					Attributes: map[string]string{
-						"user_id": userID,
-					},
-				},
-				Conversation: channel.Conversation{
-					ID:   botID + ":" + userID,
-					Type: "p2p",
-				},
-				ReceivedAt: receivedAt,
-				Source:     "companion",
-			}
-			ctx := c.Request().Context()
-			if err := h.channelManager.HandleInbound(ctx, cfg, msg); err != nil {
-				h.log.Error("HandleInbound error", slog.String("error", err.Error()))
-				_ = session.WriteJSON(map[string]string{
-					"type":    "error",
-					"message": "internal error",
-				})
-			}
+			msg := h.buildInboundMsg(botID, userID, sessionID, text, receivedAt)
+			go func() {
+				if err := h.channelManager.HandleInbound(ctx, cfg, msg); err != nil {
+					if ctx.Err() != nil {
+						return // aborted — suppress error
+					}
+					h.log.Error("HandleInbound error", slog.String("error", err.Error()))
+					_ = session.WriteJSON(map[string]string{
+						"type":    "error",
+						"message": "internal error",
+					})
+				}
+			}()
 
 		case "input_audio":
-			// Decode base64 audio data
 			audioData, err := base64.StdEncoding.DecodeString(frame.Data)
-			if err != nil {
-				h.log.Warn("invalid audio data", slog.String("error", err.Error()))
-				_ = session.WriteJSON(map[string]string{
-					"type":    "error",
-					"message": "invalid audio data",
-				})
-				continue
-			}
-			if len(audioData) == 0 {
+			if err != nil || len(audioData) == 0 {
+				if err != nil {
+					h.log.Warn("invalid audio data", slog.String("error", err.Error()))
+				}
+				_ = session.WriteJSON(map[string]string{"type": "error", "message": "invalid audio data"})
 				continue
 			}
 
-			// Use STT service to transcribe audio
 			if h.sttService == nil {
-				h.log.Warn("stt service not configured")
-				_ = session.WriteJSON(map[string]string{
-					"type":    "error",
-					"message": "语音识别服务未配置",
-				})
+				_ = session.WriteJSON(map[string]string{"type": "error", "message": "语音识别服务未配置"})
 				continue
 			}
 
-			h.log.Debug("transcribing audio", slog.Int("bytes", len(audioData)), slog.String("codec", frame.Codec))
-			ctx := c.Request().Context()
-			text, err := h.sttService.Transcribe(ctx, audioData, frame.Codec)
-			if err != nil {
-				h.log.Error("stt failed", slog.String("error", err.Error()))
-				_ = session.WriteJSON(map[string]string{
-					"type":    "error",
-					"message": "语音识别失败",
-				})
-				continue
-			}
+			session.Touch()
+			ctx := newReqCtx()
+			codec := frame.Codec
 
-			text = strings.TrimSpace(text)
-			if text == "" {
-				h.log.Debug("stt returned empty text")
-				_ = session.WriteJSON(map[string]string{
-					"type":    "error",
-					"message": "未能识别语音内容",
-				})
-				continue
-			}
+			go func() {
+				h.log.Debug("transcribing audio", slog.Int("bytes", len(audioData)), slog.String("codec", codec))
+				text, err := h.sttService.Transcribe(ctx, audioData, codec)
+				if err != nil {
+					if ctx.Err() != nil {
+						return
+					}
+					h.log.Error("stt failed", slog.String("error", err.Error()))
+					_ = session.WriteJSON(map[string]string{"type": "error", "message": "语音识别失败"})
+					return
+				}
+				text = strings.TrimSpace(text)
+				if text == "" {
+					_ = session.WriteJSON(map[string]string{"type": "error", "message": "未能识别语音内容"})
+					return
+				}
+				h.log.Info("stt result", slog.String("text", text))
+				// Echo transcription back to the client.
+				_ = session.WriteJSON(map[string]string{"type": "transcription", "text": text})
 
-			h.log.Info("stt result", slog.String("text", text))
-
-			// Send transcription back to client as a status message
-			_ = session.WriteJSON(map[string]string{
-				"type": "transcription",
-				"text": text,
-			})
-
-			// Store user text on the session and process as input_text
-			session.UserText = text
-			receivedAt := time.Now().UTC()
-			msg := channel.InboundMessage{
-				Channel: companionadapter.CompanionType,
-				Message: channel.Message{
-					Parts: []channel.MessagePart{{Type: channel.MessagePartText, Text: text}},
-				},
-				BotID:       botID,
-				ReplyTarget: sessionID,
-				RouteKey:    sessionID,
-				Sender: channel.Identity{
-					SubjectID: userID,
-					Attributes: map[string]string{
-						"user_id": userID,
-					},
-				},
-				Conversation: channel.Conversation{
-					ID:   botID + ":" + userID,
-					Type: "p2p",
-				},
-				ReceivedAt: receivedAt,
-				Source:     "companion",
-			}
-			if err := h.channelManager.HandleInbound(ctx, cfg, msg); err != nil {
-				h.log.Error("HandleInbound error", slog.String("error", err.Error()))
-				_ = session.WriteJSON(map[string]string{
-					"type":    "error",
-					"message": "internal error",
-				})
-			}
+				session.UserText = text
+				receivedAt := time.Now().UTC()
+				msg := h.buildInboundMsg(botID, userID, sessionID, text, receivedAt)
+				if err := h.channelManager.HandleInbound(ctx, cfg, msg); err != nil {
+					if ctx.Err() != nil {
+						return
+					}
+					h.log.Error("HandleInbound error (audio)", slog.String("error", err.Error()))
+					_ = session.WriteJSON(map[string]string{"type": "error", "message": "internal error"})
+				}
+			}()
 
 		case "abort":
-			// Future: cancel in-flight generation.
+			// Cancel the currently in-flight request.
+			session.Cancel()
+			h.log.Debug("abort received", slog.String("session_id", sessionID))
 
 		default:
 			h.log.Debug("unknown ws frame type", slog.String("type", frame.Type))
@@ -292,4 +265,27 @@ func (h *CompanionHandler) HandleWS(c echo.Context) error {
 		slog.String("bot_id", botID),
 	)
 	return nil
+}
+
+// buildInboundMsg constructs a channel.InboundMessage for HandleInbound.
+func (h *CompanionHandler) buildInboundMsg(botID, userID, sessionID, text string, receivedAt time.Time) channel.InboundMessage {
+	return channel.InboundMessage{
+		Channel: companionadapter.CompanionType,
+		Message: channel.Message{
+			Parts: []channel.MessagePart{{Type: channel.MessagePartText, Text: text}},
+		},
+		BotID:       botID,
+		ReplyTarget: sessionID,
+		RouteKey:    sessionID,
+		Sender: channel.Identity{
+			SubjectID: userID,
+			Attributes: map[string]string{"user_id": userID},
+		},
+		Conversation: channel.Conversation{
+			ID:   botID + ":" + userID,
+			Type: "p2p",
+		},
+		ReceivedAt: receivedAt,
+		Source:     "companion",
+	}
 }

@@ -34,3 +34,21 @@ class CompanionWsEventReceived extends CompanionEvent {
 
 /// User requested disconnect.
 class CompanionDisconnectRequested extends CompanionEvent {}
+
+/// User started holding the mic button (PTT start).
+class VoiceRecordStarted extends CompanionEvent {
+  const VoiceRecordStarted();
+}
+
+/// User released the mic button (PTT release) — audio bytes ready to send.
+class VoiceRecordStopped extends CompanionEvent {
+  const VoiceRecordStopped(this.audioBytes);
+  final List<int> audioBytes;
+  @override
+  List<Object?> get props => [audioBytes];
+}
+
+/// Voice recording was cancelled (e.g. swipe-up gesture).
+class VoiceRecordCancelled extends CompanionEvent {
+  const VoiceRecordCancelled();
+}

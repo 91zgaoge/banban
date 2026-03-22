@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 
+import '../../../core/audio/recorder.dart';
 import '../bloc/companion_bloc.dart';
 import '../bloc/companion_event.dart';
 import '../bloc/companion_state.dart';
@@ -20,7 +21,9 @@ class CompanionScreen extends StatefulWidget {
 class _CompanionScreenState extends State<CompanionScreen> {
   final _inputCtrl = TextEditingController();
   final _scrollCtrl = ScrollController();
+  final _voiceRecorder = VoiceRecorder();
   bool _isComposing = false;
+  bool _hasAudioPermission = false;
 
   @override
   void initState() {
@@ -28,12 +31,19 @@ class _CompanionScreenState extends State<CompanionScreen> {
     context.read<CompanionBloc>().add(
           CompanionConnectRequested(botId: widget.botId),
         );
+    _requestAudioPermission();
+  }
+
+  Future<void> _requestAudioPermission() async {
+    final granted = await _voiceRecorder.requestPermission();
+    if (mounted) setState(() => _hasAudioPermission = granted);
   }
 
   @override
   void dispose() {
     _inputCtrl.dispose();
     _scrollCtrl.dispose();
+    _voiceRecorder.dispose();
     super.dispose();
   }
 
@@ -44,6 +54,35 @@ class _CompanionScreenState extends State<CompanionScreen> {
     _inputCtrl.clear();
     setState(() => _isComposing = false);
     _scrollToBottom();
+  }
+
+  Future<void> _onMicPressStart() async {
+    if (!_hasAudioPermission) {
+      final granted = await _voiceRecorder.requestPermission();
+      if (!granted || !mounted) return;
+      setState(() => _hasAudioPermission = true);
+    }
+    await _voiceRecorder.start();
+    if (mounted) {
+      context.read<CompanionBloc>().add(const VoiceRecordStarted());
+    }
+  }
+
+  Future<void> _onMicPressEnd() async {
+    final bytes = await _voiceRecorder.stop();
+    if (!mounted) return;
+    if (bytes != null && bytes.isNotEmpty) {
+      context.read<CompanionBloc>().add(VoiceRecordStopped(bytes));
+    } else {
+      context.read<CompanionBloc>().add(const VoiceRecordCancelled());
+    }
+  }
+
+  Future<void> _onMicPressCancel() async {
+    await _voiceRecorder.stop(); // discard bytes
+    if (mounted) {
+      context.read<CompanionBloc>().add(const VoiceRecordCancelled());
+    }
   }
 
   void _scrollToBottom() {
@@ -83,11 +122,28 @@ class _CompanionScreenState extends State<CompanionScreen> {
       body: Column(
         children: [
           Expanded(child: _MessageList(scrollCtrl: _scrollCtrl)),
+          BlocBuilder<CompanionBloc, CompanionState>(
+            buildWhen: (prev, curr) =>
+                prev.isRecording != curr.isRecording ||
+                prev.transcriptionText != curr.transcriptionText,
+            builder: (context, state) {
+              if (state.isRecording) {
+                return const _RecordingIndicator();
+              }
+              if (state.transcriptionText != null) {
+                return _TranscriptionPreview(text: state.transcriptionText!);
+              }
+              return const SizedBox.shrink();
+            },
+          ),
           _InputBar(
             controller: _inputCtrl,
             isComposing: _isComposing,
             onChanged: (v) => setState(() => _isComposing = v.trim().isNotEmpty),
             onSend: _sendMessage,
+            onMicPressStart: _onMicPressStart,
+            onMicPressEnd: _onMicPressEnd,
+            onMicPressCancel: _onMicPressCancel,
           ),
         ],
       ),
@@ -107,6 +163,10 @@ class _CompanionScreenState extends State<CompanionScreen> {
         ConnectionStatus.disconnected => Colors.red,
       };
 }
+
+// ---------------------------------------------------------------------------
+// Message list
+// ---------------------------------------------------------------------------
 
 class _MessageList extends StatelessWidget {
   const _MessageList({required this.scrollCtrl});
@@ -141,8 +201,7 @@ class _MessageList extends StatelessWidget {
         return ListView.builder(
           controller: scrollCtrl,
           padding: const EdgeInsets.only(top: 12, bottom: 8),
-          itemCount: state.messages.length +
-              (state.errorMessage != null ? 1 : 0),
+          itemCount: state.messages.length + (state.errorMessage != null ? 1 : 0),
           itemBuilder: (_, i) {
             if (state.errorMessage != null && i == state.messages.length) {
               return MessageBubble(
@@ -163,71 +222,175 @@ class _MessageList extends StatelessWidget {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Recording indicator
+// ---------------------------------------------------------------------------
+
+class _RecordingIndicator extends StatelessWidget {
+  const _RecordingIndicator();
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(vertical: 10),
+      color: Theme.of(context).colorScheme.errorContainer.withValues(alpha: 0.15),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          const Icon(Icons.mic, color: Colors.red, size: 18),
+          const SizedBox(width: 8),
+          Text(
+            '录音中… 松开发送',
+            style: Theme.of(context)
+                .textTheme
+                .bodySmall
+                ?.copyWith(color: Colors.red),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Transcription preview
+// ---------------------------------------------------------------------------
+
+class _TranscriptionPreview extends StatelessWidget {
+  const _TranscriptionPreview({required this.text});
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      color: Theme.of(context).colorScheme.surfaceContainerHighest,
+      child: Row(
+        children: [
+          const Icon(Icons.transcribe, size: 16, color: Colors.grey),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              text,
+              style: Theme.of(context)
+                  .textTheme
+                  .bodySmall
+                  ?.copyWith(color: Colors.grey[700]),
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Input bar
+// ---------------------------------------------------------------------------
+
 class _InputBar extends StatelessWidget {
   const _InputBar({
     required this.controller,
     required this.isComposing,
     required this.onChanged,
     required this.onSend,
+    required this.onMicPressStart,
+    required this.onMicPressEnd,
+    required this.onMicPressCancel,
   });
 
   final TextEditingController controller;
   final bool isComposing;
   final ValueChanged<String> onChanged;
   final VoidCallback onSend;
+  final Future<void> Function() onMicPressStart;
+  final Future<void> Function() onMicPressEnd;
+  final Future<void> Function() onMicPressCancel;
 
   @override
   Widget build(BuildContext context) {
     final colorScheme = Theme.of(context).colorScheme;
-    return SafeArea(
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-        decoration: BoxDecoration(
-          color: colorScheme.surface,
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withValues(alpha: 0.05),
-              blurRadius: 4,
-              offset: const Offset(0, -1),
+    return BlocBuilder<CompanionBloc, CompanionState>(
+      buildWhen: (prev, curr) => prev.isRecording != curr.isRecording,
+      builder: (context, state) {
+        return SafeArea(
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+            decoration: BoxDecoration(
+              color: colorScheme.surface,
+              boxShadow: [
+                BoxShadow(
+                  color: Colors.black.withValues(alpha: 0.05),
+                  blurRadius: 4,
+                  offset: const Offset(0, -1),
+                ),
+              ],
             ),
-          ],
-        ),
-        child: Row(
-          children: [
-            Expanded(
-              child: TextField(
-                controller: controller,
-                onChanged: onChanged,
-                onSubmitted: (_) => isComposing ? onSend() : null,
-                maxLines: null,
-                textInputAction: TextInputAction.send,
-                decoration: InputDecoration(
-                  hintText: '说点什么…',
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(24),
-                    borderSide: BorderSide.none,
-                  ),
-                  filled: true,
-                  fillColor: colorScheme.surfaceContainerHighest,
-                  contentPadding: const EdgeInsets.symmetric(
-                    horizontal: 16,
-                    vertical: 10,
+            child: Row(
+              children: [
+                // Mic button (PTT)
+                GestureDetector(
+                  onLongPressStart: (_) => onMicPressStart(),
+                  onLongPressEnd: (_) => onMicPressEnd(),
+                  onLongPressCancel: () => onMicPressCancel(),
+                  child: AnimatedContainer(
+                    duration: const Duration(milliseconds: 150),
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: state.isRecording
+                          ? Colors.red.withValues(alpha: 0.15)
+                          : Colors.transparent,
+                    ),
+                    child: Padding(
+                      padding: const EdgeInsets.all(8),
+                      child: Icon(
+                        state.isRecording ? Icons.mic : Icons.mic_none_rounded,
+                        color: state.isRecording
+                            ? Colors.red
+                            : colorScheme.onSurfaceVariant,
+                      ),
+                    ),
                   ),
                 ),
-              ),
+                const SizedBox(width: 4),
+                Expanded(
+                  child: TextField(
+                    controller: controller,
+                    onChanged: onChanged,
+                    onSubmitted: (_) => isComposing ? onSend() : null,
+                    maxLines: null,
+                    textInputAction: TextInputAction.send,
+                    decoration: InputDecoration(
+                      hintText: state.isRecording ? '正在录音…' : '说点什么…',
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(24),
+                        borderSide: BorderSide.none,
+                      ),
+                      filled: true,
+                      fillColor: colorScheme.surfaceContainerHighest,
+                      contentPadding: const EdgeInsets.symmetric(
+                        horizontal: 16,
+                        vertical: 10,
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 4),
+                AnimatedOpacity(
+                  opacity: isComposing ? 1 : 0.4,
+                  duration: const Duration(milliseconds: 150),
+                  child: IconButton.filled(
+                    onPressed: isComposing ? onSend : null,
+                    icon: const Icon(Icons.send_rounded),
+                  ),
+                ),
+              ],
             ),
-            const SizedBox(width: 4),
-            AnimatedOpacity(
-              opacity: isComposing ? 1 : 0.4,
-              duration: const Duration(milliseconds: 150),
-              child: IconButton.filled(
-                onPressed: isComposing ? onSend : null,
-                icon: const Icon(Icons.send_rounded),
-              ),
-            ),
-          ],
-        ),
-      ),
+          ),
+        );
+      },
     );
   }
 }

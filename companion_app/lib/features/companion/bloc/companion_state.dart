@@ -9,6 +9,9 @@ class CompanionState extends Equatable {
     this.messages = const [],
     this.connectionStatus = ConnectionStatus.disconnected,
     this.isAssistantTyping = false,
+    this.isRecording = false,
+    this.isTtsPlaying = false,
+    this.transcriptionText,
     this.botId,
     this.errorMessage,
   });
@@ -16,6 +19,16 @@ class CompanionState extends Equatable {
   final List<ChatMessage> messages;
   final ConnectionStatus connectionStatus;
   final bool isAssistantTyping;
+
+  /// True while the microphone is actively recording.
+  final bool isRecording;
+
+  /// True while TTS audio is playing back.
+  final bool isTtsPlaying;
+
+  /// Live transcription text echoed from the server (shown while waiting for reply).
+  final String? transcriptionText;
+
   final String? botId;
   final String? errorMessage;
 
@@ -25,14 +38,21 @@ class CompanionState extends Equatable {
     List<ChatMessage>? messages,
     ConnectionStatus? connectionStatus,
     bool? isAssistantTyping,
+    bool? isRecording,
+    bool? isTtsPlaying,
+    String? transcriptionText,
     String? botId,
     String? errorMessage,
     bool clearError = false,
+    bool clearTranscription = false,
   }) {
     return CompanionState(
       messages: messages ?? this.messages,
       connectionStatus: connectionStatus ?? this.connectionStatus,
       isAssistantTyping: isAssistantTyping ?? this.isAssistantTyping,
+      isRecording: isRecording ?? this.isRecording,
+      isTtsPlaying: isTtsPlaying ?? this.isTtsPlaying,
+      transcriptionText: clearTranscription ? null : (transcriptionText ?? this.transcriptionText),
       botId: botId ?? this.botId,
       errorMessage: clearError ? null : (errorMessage ?? this.errorMessage),
     );
@@ -43,6 +63,9 @@ class CompanionState extends Equatable {
         messages,
         connectionStatus,
         isAssistantTyping,
+        isRecording,
+        isTtsPlaying,
+        transcriptionText,
         botId,
         errorMessage,
       ];
